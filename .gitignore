@@ -1,0 +1,12 @@
+# 本地/生产环境配置，包含数据库密码、管理员密码和 JWT 密钥
+config.php
+
+# 本地导出数据与临时文件
+nav_export_*.json
+*.log
+
+# 编辑器和系统文件
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

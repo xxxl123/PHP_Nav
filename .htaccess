@@ -1,0 +1,8 @@
+RewriteEngine On
+RewriteBase /
+
+# API requests are handled by the PHP compatibility layer.
+RewriteRule ^api(?:/.*)?$ api.php [L,QSA]
+
+# Keep the static single-page frontend as the default document.
+DirectoryIndex index.html index.php
