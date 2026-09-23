@@ -68,8 +68,7 @@
 
 ## 配置示例
 
-`config.php` 中不要提交真实密码或密钥。建议复制一份本地配置模板，再通过部署环境注入敏感值。
-
+`config.php` 
 ```php
 const DB_HOST = '127.0.0.1';
 const DB_PORT = 3306;
@@ -83,12 +82,7 @@ const NAV_DEFAULT_USER = 'default';
 const AUTO_BACKUP_INTERVAL = 600; // 自动备份间隔，单位：秒
 ```
 
-生产环境至少应满足：
 
-- 管理员密码不要与 FTP、数据库密码相同
-- `NAV_JWT_SECRET` 使用随机生成的长字符串
-- 不要把 `config.php`、数据库备份或真实导出文件提交到公开仓库
-- 开启 HTTPS，并定期备份 MySQL 数据库
 
 ## 导入 / 导出格式
 
@@ -158,6 +152,4 @@ GET  /api.php?path=/api/icon&url=https%3A%2F%2Fexample.com%2F
 
 导入后的数据可以继续从本项目导出，格式仍兼容 Cloudflare Workers 版本。
 
-## 许可证和上游项目
 
-本项目的前端界面和数据结构基于 [Cloudflare Workers 版本](https://github.com/xxxl123/-cf-workers-nav) 的公开实现进行 PHP + MySQL 适配。发布时请同时遵守上游项目的许可证和第三方资源许可要求。
