@@ -3731,24 +3731,27 @@
                             data = JSON.parse(content);
                             if (typeof data !== 'object' || data === null) throw new Error("Invalid JSON");
                         }
+                        const payload = (data && data.categories) ? { categories: data.categories } : data;
                         const res = await fetchWithAuth("/api.php?path=/api/importData", {
                             method: "POST",
                             headers: {
                                 "Content-Type": "application/json"
                             },
-                            body: JSON.stringify(data)
+                            body: JSON.stringify(payload)
                         });
                         if (res.status === 401) {
                             logout();
                             await customAlert('登录凭证已过期，请重新登录');
                             return;
                         }
-                        if (!res.ok) throw new Error("Import failed");
+                        let result = {};
+                        try { result = await res.json(); } catch (parseErr) { result = {}; }
+                        if (!res.ok) throw new Error(result.message || result.error || "Import failed");
                         await customAlert('数据导入成功！');
                         location.reload(); 
                     } catch (error) {
                         console.error("解析文件失败:", error);
-                        await customAlert('文件格式错误，请检查文件内容！');
+                        await customAlert(error && error.message ? ('导入失败：' + error.message) : '文件格式错误，请检查文件内容！');
                     }
                 };
                 reader.readAsText(file);
