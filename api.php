@@ -2,6 +2,304 @@
 declare(strict_types=1);
 require __DIR__ . '/config.php';
 
+function json_response(array $data, int $status = 200): void {
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+function request_json(int $max = 1048576): array {
+    $raw = file_get_contents('php://input') ?: '';
+    if (strlen($raw) > $max) json_response(['error' => 'PAYLOAD_TOO_LARGE'], 413);
+    if ($raw === '') return [];
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : [];
+}
+
+function db(): PDO {
+    static $pdo = null;
+    if ($pdo instanceof PDO) return $pdo;
+    $dsn = 'mysql:host=' . DB_HOST . ';port=' . DB_PORT . ';dbname=' . DB_NAME . ';charset=utf8mb4';
+    $pdo = new PDO($dsn, DB_USER, DB_PASS, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES => false,
+    ]);
+    init_schema($pdo);
+    return $pdo;
+}
+
+function init_schema(PDO $pdo): void {
+    $pdo->exec('CREATE TABLE IF NOT EXISTS nav_data (
+        user_key VARCHAR(64) NOT NULL PRIMARY KEY,
+        data_json LONGTEXT NOT NULL,
+        updated_at INT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS nav_backups (
+        id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        user_key VARCHAR(64) NOT NULL,
+        data_json LONGTEXT NOT NULL,
+        created_at INT NOT NULL,
+        KEY user_created (user_key, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS nav_theme (
+        user_key VARCHAR(64) NOT NULL PRIMARY KEY,
+        theme_json LONGTEXT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS nav_meta (
+        meta_key VARCHAR(64) NOT NULL PRIMARY KEY,
+        meta_value TEXT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+}
+
+function b64url_encode(string $data): string {
+    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+}
+
+function b64url_decode(string $data): string|false {
+    $pad = strlen($data) % 4;
+    if ($pad) $data .= str_repeat('=', 4 - $pad);
+    return base64_decode(strtr($data, '-_', '+/'), true);
+}
+
+function current_keygen(): int {
+    $stmt = db()->prepare('SELECT meta_value FROM nav_meta WHERE meta_key=?');
+    $stmt->execute(['keygen']);
+    $row = $stmt->fetch();
+    if (!$row) {
+        db()->prepare('INSERT INTO nav_meta(meta_key,meta_value) VALUES (?,?)')->execute(['keygen', '1']);
+        return 1;
+    }
+    return max(1, (int)$row['meta_value']);
+}
+
+function bump_keygen(): void {
+    $next = current_keygen() + 1;
+    $stmt = db()->prepare('INSERT INTO nav_meta(meta_key,meta_value) VALUES (?,?) ON DUPLICATE KEY UPDATE meta_value=VALUES(meta_value)');
+    $stmt->execute(['keygen', (string)$next]);
+}
+
+function make_token(string $type, int $ttl): string {
+    $header = b64url_encode(json_encode(['alg' => 'HS256', 'typ' => 'JWT'], JSON_UNESCAPED_SLASHES));
+    $payload = b64url_encode(json_encode([
+        'type' => $type,
+        'sub' => NAV_DEFAULT_USER,
+        'kg' => current_keygen(),
+        'iat' => time(),
+        'exp' => time() + $ttl,
+    ], JSON_UNESCAPED_SLASHES));
+    $sig = b64url_encode(hash_hmac('sha256', $header . '.' . $payload, NAV_JWT_SECRET, true));
+    return $header . '.' . $payload . '.' . $sig;
+}
+
+function read_token(?string $token, ?string $expectType = null): ?array {
+    if ($token === null || $token === '') return null;
+    $token = trim($token);
+    if (str_starts_with($token, 'Bearer ')) $token = trim(substr($token, 7));
+    $parts = explode('.', $token);
+    if (count($parts) !== 3) return null;
+    [$header, $payload, $sig] = $parts;
+    $expected = b64url_encode(hash_hmac('sha256', $header . '.' . $payload, NAV_JWT_SECRET, true));
+    if (!hash_equals($expected, $sig)) return null;
+    $raw = b64url_decode($payload);
+    if ($raw === false) return null;
+    $data = json_decode($raw, true);
+    if (!is_array($data)) return null;
+    if (($data['exp'] ?? 0) < time()) return null;
+    if (($data['kg'] ?? 0) !== current_keygen()) return null;
+    if ($expectType !== null && ($data['type'] ?? '') !== $expectType) return null;
+    return $data;
+}
+
+function bearer(): ?string {
+    $header = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+    if ($header === '' && function_exists('apache_request_headers')) {
+        $headers = apache_request_headers();
+        foreach ($headers as $key => $value) {
+            if (strtolower((string)$key) === 'authorization') {
+                $header = (string)$value;
+                break;
+            }
+        }
+    }
+    return $header !== '' ? $header : null;
+}
+
+function require_auth(): array {
+    $payload = read_token(bearer(), 'access');
+    if (!$payload) json_response(['error' => 'Unauthorized'], 401);
+    return $payload;
+}
+
+function set_refresh_cookie(string $token, int $expires): void {
+    setcookie('refreshToken', $token, [
+        'expires' => $expires,
+        'path' => '/',
+        'secure' => true,
+        'httponly' => true,
+        'samesite' => 'Strict',
+    ]);
+}
+
+function load_data(): array {
+    $stmt = db()->prepare('SELECT data_json FROM nav_data WHERE user_key=?');
+    $stmt->execute([NAV_DEFAULT_USER]);
+    $row = $stmt->fetch();
+    if (!$row) return ['categories' => new stdClass()];
+    $data = json_decode((string)$row['data_json'], true);
+    if (!is_array($data) || !isset($data['categories']) || !is_array($data['categories'])) {
+        return ['categories' => new stdClass()];
+    }
+    return ['categories' => $data['categories']];
+}
+
+function save_data(array $data): void {
+    $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    $stmt = db()->prepare('INSERT INTO nav_data(user_key,data_json,updated_at) VALUES (?,?,?) ON DUPLICATE KEY UPDATE data_json=VALUES(data_json), updated_at=VALUES(updated_at)');
+    $stmt->execute([NAV_DEFAULT_USER, $json, time()]);
+    create_backup(false);
+}
+
+function public_data(array $data): array {
+    $categories = $data['categories'] ?? [];
+    if ($categories instanceof stdClass) $categories = [];
+    $out = [];
+    foreach ($categories as $name => $cat) {
+        if (!is_array($cat)) continue;
+        $links = [];
+        foreach (($cat['links'] ?? []) as $link) {
+            if (!is_array($link) || !empty($link['isPrivate'])) continue;
+            $links[] = $link;
+        }
+        $out[$name] = [
+            'isHidden' => !empty($cat['isHidden']),
+            'links' => $links,
+        ];
+    }
+    return ['categories' => $out ?: new stdClass()];
+}
+
+function to_bool(mixed $value): bool {
+    if (is_bool($value)) return $value;
+    if (is_int($value) || is_float($value)) return $value != 0;
+    if (is_string($value)) return in_array(strtolower(trim($value)), ['1', 'true', 'yes', 'on'], true);
+    return false;
+}
+
+function normalize_link_url(string $url): string {
+    $url = trim($url);
+    if ($url === '') return '';
+    if (preg_match('#^https?://#i', $url)) return $url;
+    if (str_starts_with($url, '//')) return 'https:' . $url;
+    if (preg_match('/^(javascript|vbscript|data|about|chrome|edge|blob|magnet|file):/i', $url)) return $url;
+    if (preg_match('~^(?:[A-Za-z0-9._-]+|\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?(?:[/?#].*)?$~', $url)) {
+        return 'https://' . $url;
+    }
+    return $url;
+}
+
+function is_allowed_link_url(string $url): bool {
+    $url = normalize_link_url($url);
+    if ($url === '' || mb_strlen($url) > 2000) return false;
+    if (!preg_match('#^https?://#i', $url)) return false;
+    $parts = parse_url($url);
+    return is_array($parts) && !empty($parts['host']);
+}
+
+function validate_categories($categories, ?string &$error = null): bool {
+    $error = null;
+    if (!is_array($categories)) {
+        $error = '导入数据缺少分类列表';
+        return false;
+    }
+    if (count($categories) > 200) {
+        $error = '分类数量超过限制';
+        return false;
+    }
+    foreach ($categories as $name => $cat) {
+        if (!is_string($name) || $name === '' || mb_strlen($name) > 80) {
+            $error = '分类名称无效';
+            return false;
+        }
+        if (!is_array($cat) || !isset($cat['links']) || !is_array($cat['links'])) {
+            $error = '分类「' . $name . '」缺少链接列表';
+            return false;
+        }
+        if (count($cat['links']) > 500) {
+            $error = '分类「' . $name . '」链接数量超过限制';
+            return false;
+        }
+        foreach ($cat['links'] as $link) {
+            if (!is_array($link)) {
+                $error = '分类「' . $name . '」存在无效链接';
+                return false;
+            }
+            $title = trim((string)($link['name'] ?? ''));
+            $url = trim((string)($link['url'] ?? ''));
+            if ($title === '' || mb_strlen($title) > 120) {
+                $error = '分类「' . $name . '」存在无效链接名称';
+                return false;
+            }
+            if ($url === '' || mb_strlen($url) > 2000 || !is_allowed_link_url($url)) {
+                $error = '分类「' . $name . '」中「' . $title . '」的地址无效';
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+function sanitize_categories(array $categories): array {
+    $out = [];
+    foreach ($categories as $name => $cat) {
+        $name = mb_substr(trim((string)$name), 0, 80);
+        $links = [];
+        foreach (($cat['links'] ?? []) as $link) {
+            if (!is_array($link)) continue;
+            $url = mb_substr(normalize_link_url((string)($link['url'] ?? '')), 0, 2000);
+            $item = [
+                'name' => mb_substr(trim((string)($link['name'] ?? '')), 0, 120),
+                'url' => $url,
+                'tips' => mb_substr(trim((string)($link['tips'] ?? '')), 0, 500),
+                'icon' => mb_substr(trim((string)($link['icon'] ?? '')), 0, 2000),
+                'isPrivate' => to_bool($link['isPrivate'] ?? false),
+                'isDirect' => to_bool($link['isDirect'] ?? false),
+                'category' => $name,
+            ];
+            $links[] = $item;
+        }
+        $out[$name] = [
+            'isHidden' => to_bool($cat['isHidden'] ?? false),
+            'links' => $links,
+        ];
+    }
+    return $out;
+}
+
+function create_backup(bool $force = false): bool {
+    $now = time();
+    if (!$force) {
+        $stmt = db()->prepare('SELECT created_at FROM nav_backups WHERE user_key=? ORDER BY created_at DESC LIMIT 1');
+        $stmt->execute([NAV_DEFAULT_USER]);
+        $row = $stmt->fetch();
+        if ($row && ($now - (int)$row['created_at']) < AUTO_BACKUP_INTERVAL) return false;
+    }
+    $data = load_data();
+    $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    $ins = db()->prepare('INSERT INTO nav_backups(user_key,data_json,created_at) VALUES (?,?,?)');
+    $ins->execute([NAV_DEFAULT_USER, $json, $now]);
+    $ids = db()->prepare('SELECT id FROM nav_backups WHERE user_key=? ORDER BY created_at DESC');
+    $ids->execute([NAV_DEFAULT_USER]);
+    $all = $ids->fetchAll();
+    if (count($all) > 10) {
+        $del = db()->prepare('DELETE FROM nav_backups WHERE id=?');
+        foreach (array_slice($all, 10) as $row) $del->execute([(int)$row['id']]);
+    }
+    return true;
+}
+
 $routedPath = isset($_GET['path']) ? (string)$_GET['path'] : (string)($_SERVER['REQUEST_URI'] ?? '/');
 if (isset($_GET['path']) && str_contains($routedPath, '?')) {
     $embedded = parse_url($routedPath, PHP_URL_QUERY) ?: '';
@@ -169,7 +467,7 @@ try {
         if (!hash_equals(NAV_ADMIN_PASSWORD, $password)) json_response(['valid' => false, 'remaining' => 4], 403);
         $access = make_token('access', 7200);
         $refresh = make_token('refresh', 2592000);
-        setcookie('refreshToken', $refresh, ['expires' => time() + 2592000, 'path' => '/api/refreshToken', 'secure' => true, 'httponly' => true, 'samesite' => 'Strict']);
+        set_refresh_cookie($refresh, time() + 2592000);
         json_response(['valid' => true, 'token' => 'Bearer ' . $access]);
     }
     if ($path === '/api/refreshToken' && $method === 'POST') {
@@ -177,12 +475,12 @@ try {
         if (!$payload || ($payload['type'] ?? '') !== 'refresh') json_response(['error' => 'Refresh token expired'], 401);
         $access = make_token('access', 7200);
         $refresh = make_token('refresh', 2592000);
-        setcookie('refreshToken', $refresh, ['expires' => time() + 2592000, 'path' => '/api/refreshToken', 'secure' => true, 'httponly' => true, 'samesite' => 'Strict']);
+        set_refresh_cookie($refresh, time() + 2592000);
         json_response(['accessToken' => 'Bearer ' . $access]);
     }
     if ($path === '/api/validateToken') { require_auth(); json_response(['valid' => true]); }
     if ($path === '/api/logout' && $method === 'POST') {
-        require_auth(); bump_keygen(); setcookie('refreshToken', '', ['expires' => time() - 3600, 'path' => '/api/refreshToken', 'secure' => true, 'httponly' => true, 'samesite' => 'Strict']); json_response(['success' => true]);
+        require_auth(); bump_keygen(); set_refresh_cookie('', time() - 3600); json_response(['success' => true]);
     }
     if ($path === '/api/getLinks') {
         $data = load_data();
@@ -191,7 +489,8 @@ try {
     }
     if (in_array($path, ['/api/saveData', '/api/importData'], true) && $method === 'POST') {
         require_auth(); $body = request_json(); $categories = $body['categories'] ?? null;
-        if (!validate_categories($categories)) json_response(['error' => 'INVALID_DATA'], 422);
+        $error = null;
+        if (!validate_categories($categories, $error)) json_response(['error' => 'INVALID_DATA', 'message' => $error ?: '导入数据无效'], 422);
         save_data(['categories' => sanitize_categories($categories)]); json_response(['success' => true, 'rev' => (string)time()]);
     }
     if ($path === '/api/backupData' && $method === 'POST') {

@@ -109,7 +109,7 @@ const AUTO_BACKUP_INTERVAL = 600; // 自动备份间隔，单位：秒
 }
 ```
 
-因此可以直接使用原 Cloudflare Worker 版本导出的 JSON 文件迁移到本项目。
+导入会完整保留 `isPrivate`（登录后可见的私密链接）和 `isHidden`。地址缺少 `http://` 或 `https://` 时会自动补成 `https://`，例如 `pictures.us.ci`。
 
 ## API 概览
 
