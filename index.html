@@ -522,8 +522,8 @@
                                         编辑模式
                                     </button>
 
-                                    <!-- 导入导出入口始终显示，实际操作仍要求登录 -->
-                                    <div id="data-tools-menu">
+                                    <!-- 导入导出仅登录后显示 -->
+                                    <div id="data-tools-menu" class="hidden">
                                          <div class="h-px bg-muted dark:bg-[color-mix(in_oklab,var(--muted)_50%,transparent)] mx-1 my-1"></div>
                                          <button onclick="exportData()" class="w-full text-left px-3 py-2 rounded-lg text-sm text-base-foreground dark:text-base-foreground hover:bg-[var(--menu-hover)] hover:text-amber-600 dark:hover:text-amber-400 transition-colors flex items-center gap-3">
                                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
@@ -1768,10 +1768,10 @@
         
         if(isLoggedIn) {
             loginBtn.classList.replace('text-red-500', 'text-base-foreground');
+            if(dataToolsMenu) dataToolsMenu.classList.remove('hidden');
         } else {
-            // 导入/导出入口保持显示；点击后由 validateTokenOrRedirect() 引导登录。
+            if(dataToolsMenu) dataToolsMenu.classList.add('hidden');
         }
-        if(dataToolsMenu) dataToolsMenu.classList.remove('hidden');
         
         if (isEditMode) {
             editModeBtn.innerHTML = '<span class="text-red-500 flex items-center gap-2"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>退出编辑</span>';
